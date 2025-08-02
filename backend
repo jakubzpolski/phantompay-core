@@ -1,0 +1,216 @@
+import os
+import secrets
+import json
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
+from pydantic import BaseModel
+from cryptography.fernet import Fernet
+import httpx
+import qrcode
+import base64
+from io import BytesIO
+import redis
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+app = FastAPI(
+    title="PhantomPay API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
+
+# ===== MONETIZATION =====
+FEE_PERCENT = 0.015  # 1.5% transaction fee
+MIN_FEE = 0.50       # $0.50 minimum fee
+PREMIUM_FEATURES = {
+    "extended_expiry": (1.00, timedelta(days=7)),
+    "recurring": (5.00, "monthly"),
+    "custom_branding": (10.00, "monthly")
+}
+# ========================
+
+# Security
+security = HTTPBearer()
+cipher_suite = Fernet(os.getenv("FERNET_KEY").encode())
+
+# Redis connection
+redis_pool = redis.ConnectionPool(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=6379,
+    password=os.getenv("REDIS_PASS"),
+    decode_responses=False,
+    max_connections=10
+)
+
+def get_redis():
+    return redis.Redis(connection_pool=redis_pool)
+
+class PaymentRequest(BaseModel):
+    amount: float
+    currency: str = "USD"
+    description: str
+    payer_contact: str = "anonymous"
+    payment_methods: list = ["BTC", "XMR", "USDT", "PayPal"]
+    premium_features: list = []
+
+def generate_crypto_address(currency: str):
+    """Generate simulated crypto address"""
+    prefixes = {
+        "BTC": "bc1q",
+        "XMR": "4",
+        "ETH": "0x",
+        "USDT": "0x"
+    }
+    return prefixes.get(currency, "") + secrets.token_hex(12)[:34-len(prefixes.get(currency, ""))]
+
+async def verify_bearer_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    # In production: validate token against known patterns
+    return credentials.credentials
+
+@app.post("/create-request")
+async def create_payment_request(
+    request: PaymentRequest, 
+    token: str = Depends(verify_bearer_token),
+    r: redis.Redis = Depends(get_redis)
+):
+    # Calculate fees
+    fee_amount = max(request.amount * FEE_PERCENT, MIN_FEE)
+    
+    # Add premium feature costs
+    for feature in request.premium_features:
+        if feature in PREMIUM_FEATURES:
+            fee_amount += PREMIUM_FEATURES[feature][0]
+    
+    # Generate IDs
+    request_id = secrets.token_urlsafe(16)
+    view_key = secrets.token_urlsafe(12)
+    
+    # Set expiration
+    expiry_hours = 72
+    if "extended_expiry" in request.premium_features:
+        expiry_hours = 168
+    
+    expires_at = datetime.utcnow() + timedelta(hours=expiry_hours)
+    
+    # Encrypt data
+    encrypted_data = cipher_suite.encrypt(json.dumps({
+        "amount": request.amount,
+        "currency": request.currency,
+        "description": request.description,
+        "payer_contact": request.payer_contact,
+        "premium_features": request.premium_features
+    }).encode())
+    
+    # Store in Redis
+    r.hset(f"request:{request_id}", mapping={
+        "view_key": view_key,
+        "data": encrypted_data,
+        "methods": json.dumps(request.payment_methods),
+        "fee_amount": str(fee_amount),
+        "fee_paid": "0",
+        "created": datetime.utcnow().isoformat(),
+        "expires": expires_at.isoformat()
+    })
+    r.expireat(f"request:{request_id}", int(expires_at.timestamp()))
+    
+    # Generate fee address
+    fee_address = generate_crypto_address("BTC")
+    
+    return {
+        "request_id": request_id,
+        "view_key": view_key,
+        "fee_amount": fee_amount,
+        "fee_address": fee_address,
+        "expires_at": expires_at.isoformat()
+    }
+
+@app.get("/request/{request_id}")
+async def get_payment_request(
+    request_id: str,
+    view_key: str,
+    r: redis.Redis = Depends(get_redis)
+):
+    data = r.hgetall(f"request:{request_id}")
+    if not data:
+        raise HTTPException(404, "Request not found")
+    
+    if data.get(b"view_key").decode() != view_key:
+        raise HTTPException(403, "Invalid access")
+    
+    if data.get(b"fee_paid").decode() == "0":
+        raise HTTPException(402, "Fee not paid")
+    
+    # Decrypt data
+    decrypted = json.loads(cipher_suite.decrypt(data[b"data"]).decode()
+    return {
+        **decrypted,
+        "payment_methods": json.loads(data[b"methods"]),
+        "created_at": data[b"created"].decode(),
+        "expires_at": data[b"expires"].decode()
+    }
+
+@app.post("/webhook/fee-paid/{request_id}")
+async def fee_paid_webhook(
+    request_id: str,
+    request: Request,
+    r: redis.Redis = Depends(get_redis)
+):
+    # Simplified verification (in production: validate blockchain signature)
+    payload = await request.json()
+    if payload.get("status") != "confirmed":
+        raise HTTPException(400, "Invalid payment status")
+    
+    if r.hexists(f"request:{request_id}", "fee_paid"):
+        r.hset(f"request:{request_id}", "fee_paid", "1")
+        return {"status": "updated"}
+    return {"status": "not_found"}
+
+@app.get("/pay/{request_id}/{method}")
+async def process_payment(
+    request_id: str,
+    method: str,
+    view_key: str,
+    r: redis.Redis = Depends(get_redis)
+):
+    data = r.hgetall(f"request:{request_id}")
+    if not data:
+        raise HTTPException(404, "Request not found")
+    
+    if data.get(b"view_key").decode() != view_key:
+        raise HTTPException(403, "Invalid access")
+    
+    if data.get(b"fee_paid").decode() == "0":
+        raise HTTPException(402, "Fee not paid")
+    
+    # Decrypt data
+    decrypted = json.loads(cipher_suite.decrypt(data[b"data"]).decode()
+    
+    # Generate payment details
+    if method in ["BTC", "XMR", "ETH", "USDT"]:
+        address = generate_crypto_address(method)
+        crypto_amount = decrypted["amount"] / 50000  # Simplified conversion
+        
+        # Generate QR code
+        qr = qrcode.make(f"{method}:{address}?amount={crypto_amount}")
+        buffered = BytesIO()
+        qr.save(buffered, format="PNG")
+        qr_base64 = base64.b64encode(buffered.getvalue()).decode()
+        
+        return {
+            "payment_method": method,
+            "address": address,
+            "amount": crypto_amount,
+            "qr_code": f"data:image/png;base64,{qr_base64}",
+            "memo": decrypted["description"][:40]
+        }
+    elif method == "PayPal":
+        return {
+            "payment_method": "PayPal",
+            "link": f"https://paypal.me/phantompay/{decrypted['amount']}?note={decrypted['description'][:40]}"
+        }
+    else:
+        raise HTTPException(400, "Unsupported payment method")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "active", "timestamp": datetime.utcnow().isoformat()}
